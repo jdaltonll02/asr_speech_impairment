@@ -1,0 +1,76 @@
+data_root: /data/user_data/jgibson2/asr_sprint/data
+models_root: /data/user_data/jgibson2/asr_sprint/models
+results_root: /data/user_data/jgibson2/asr_sprint/results
+cache_dir: /data/user_data/jgibson2/asr_sprint/model_cache
+
+models:
+  ky:
+    model_id: cdli/whisper-large-v3_finetuned_rwandan_kinyarwanda_nonstandard_speech_v1.0
+    language_token: sw
+    task: transcribe
+    ctc_fallback_id: facebook/wav2vec2-large-xlsr-53  # placeholder; replace with KY CTC model if available
+  en:
+    model_id: cdli/whisper-large-v3_finetuned_rwandan_english_nonstandard_speech_v1.0
+    language_token: en
+    task: transcribe
+    ctc_fallback_id: facebook/wav2vec2-large-960h
+
+datasets:
+  ky:
+    hf_id: cdli/rwandan_kinyarwanda_nonstandard_speech_v1.0
+    audio_column: audio
+    reference_column: sentence
+    split_map:
+      dev: validation
+      test: test
+  en:
+    hf_id: cdli/rwandan_english_nonstandard_speech_v1.0
+    audio_column: audio
+    reference_column: sentence
+    split_map:
+      dev: validation
+      test: test
+
+decode:
+  batch_size: 8
+  beam_size: 1
+  temperature: 0
+  compression_ratio_threshold: 2.4
+  return_dict_in_generate: true
+  output_scores: true
+
+catastrophic:
+  uncapped_wer_threshold: 1.0
+  length_ratio_threshold: 2.0
+  repeated_4gram_threshold: 0.1  # refined on dev via set_repeated_4gram_threshold_on_dev()
+  repeated_4gram_percentile: 95  # percentile used for dev-based threshold selection
+
+interventions:
+  enabled:
+    - repetition_penalty
+    - max_length_from_audio
+    - temperature_fallback
+    - beam_search
+    - vad_trim
+    - ctc_fallback
+  repetition_penalty_value: 1.3
+  max_length_multiplier: 6      # max_new_tokens = audio_duration_s * max_length_multiplier + 10
+  temperature_fallback_temp: 0.2
+  temperature_fallback_threshold: 2.4
+  beam_size: 5
+  vad_aggressiveness: 2
+  ctc_flag_wer_threshold: 1.0
+
+slurm:
+  partition: preempt
+  gres: gpu:1
+  mem: 32G
+  time_baseline: "04:00:00"
+  time_interventions: "08:00:00"
+  time_analysis: "02:00:00"
+
+venv_path: /data/user_data/jgibson2/asr_sprint/venv
+
+published_wer:
+  ky_test_wer: 0.72
+  en_test_wer: 0.24
