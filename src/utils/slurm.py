@@ -36,8 +36,10 @@ def write_slurm_script(
     time: str,
     venv_path: str,
     project_root: str,
-    log_dir: str = "/data/user_data/jgibson2/asr_sprint/results/rq1/logs",
+    log_dir: str | None = None,
     extra_sbatch_lines: list[str] | None = None,
+    hf_home: str | None = None,
+    transformers_cache: str | None = None,
 ) -> None:
     """Write a ``.slurm`` batch script to *path*.
 
@@ -62,10 +64,24 @@ def write_slurm_script(
     project_root:
         Absolute path to the project root (added to ``PYTHONPATH``).
     log_dir:
-        Directory for Slurm stdout/stderr log files.
+        Directory for Slurm stdout/stderr log files.  When ``None`` the
+        caller must ensure the ``--output`` directive is supplied via
+        *extra_sbatch_lines*, or a sensible default derived from *cfg* should
+        be passed by the caller.
     extra_sbatch_lines:
         Additional ``#SBATCH`` directives (without the ``#SBATCH`` prefix).
+    hf_home:
+        Value for the ``HF_HOME`` environment variable.  Derived from the
+        config ``data_root`` by the caller; no default applied here so that
+        no path is ever hardcoded in this function.
+    transformers_cache:
+        Value for the ``TRANSFORMERS_CACHE`` environment variable.  Same
+        rationale as *hf_home*.
     """
+    output_directive = (
+        f"{log_dir}/{job_name}_%j.log" if log_dir else f"{job_name}_%j.log"
+    )
+
     lines = [
         "#!/bin/bash",
         f"#SBATCH --job-name={job_name}",
@@ -73,7 +89,7 @@ def write_slurm_script(
         f"#SBATCH --gres={gres}",
         f"#SBATCH --mem={mem}",
         f"#SBATCH --time={time}",
-        f"#SBATCH --output={log_dir}/{job_name}_%j.log",
+        f"#SBATCH --output={output_directive}",
         "#SBATCH --signal=B:USR1@60",
     ]
 
@@ -85,8 +101,14 @@ def write_slurm_script(
         "",
         f"source {venv_path}/bin/activate",
         f"export PYTHONPATH={project_root}:$PYTHONPATH",
-        "export HF_HOME=/data/user_data/jgibson2/asr_sprint/hf_cache",
-        "export TRANSFORMERS_CACHE=/data/user_data/jgibson2/asr_sprint/model_cache",
+    ]
+
+    if hf_home is not None:
+        lines.append(f"export HF_HOME={hf_home}")
+    if transformers_cache is not None:
+        lines.append(f"export TRANSFORMERS_CACHE={transformers_cache}")
+
+    lines += [
         "",
         command,
     ]

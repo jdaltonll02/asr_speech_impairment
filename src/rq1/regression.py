@@ -7,6 +7,14 @@ target), evaluates on test, and produces:
   bootstrap 95 % CIs, AUC-ROC
 - ``results_root/rq1/regression_coefs.png`` — coefficient forest plot
 
+Public API (plan Step 10)
+-------------------------
+run_regression(df, feature_cols, cfg)  → dict with coef, feature_names, auc_roc, report
+build_feature_matrix(df)               → (X, y, feature_names)
+fit_regression(X_train, y_train)       → fitted LogisticRegression
+compute_bootstrap_cis(model, X, y, …)  → DataFrame with odds ratios and CIs
+stratified_sample(df, n, …)            → sample of catastrophic utterances for R4
+
 Usage::
 
     python -m src.rq1.regression
@@ -227,6 +235,61 @@ def _plot_coefs(coef_df, output_path: str) -> None:
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
+
+
+def run_regression(df, feature_cols: "list[str]", cfg) -> dict:
+    """Fit logistic regression and return a results dict.
+
+    This is the plan Step 10 public entry point.  It wraps
+    ``build_feature_matrix``, ``fit_regression``, and
+    ``compute_bootstrap_cis`` into a single callable.
+
+    Parameters
+    ----------
+    df:
+        Per-utterance DataFrame with diagnostic columns (from ``failure.py``).
+    feature_cols:
+        Column names to include as features.  Unused categorical / numeric
+        columns that are absent from *df* are filled with safe defaults inside
+        ``build_feature_matrix``.
+    cfg:
+        Loaded configuration object (from ``load_config()``).
+
+    Returns
+    -------
+    dict
+        Keys: ``coef`` (list[float]), ``feature_names`` (list[str]),
+        ``auc_roc`` (float), ``report`` (dict from
+        ``classification_report``), ``bootstrap_cis`` (list[dict]).
+    """
+    import numpy as np
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import roc_auc_score, classification_report
+
+    X, y, actual_feature_names = build_feature_matrix(df)
+
+    scaler = StandardScaler()
+    X_sc = scaler.fit_transform(X)
+
+    model = fit_regression(X_sc, y)
+
+    y_pred = model.predict(X_sc)
+    try:
+        y_prob = model.predict_proba(X_sc)[:, 1]
+        auc = float(roc_auc_score(y, y_prob))
+    except Exception:
+        auc = float("nan")
+
+    report = classification_report(y, y_pred, output_dict=True)
+    coef_df = compute_bootstrap_cis(model, X_sc, y, actual_feature_names)
+
+    return {
+        "coef": model.coef_[0].tolist(),
+        "feature_names": actual_feature_names,
+        "auc_roc": auc,
+        "report": report,
+        "bootstrap_cis": coef_df.to_dict(orient="records"),
+    }
 
 
 def stratified_sample(df, n: int = 50, random_seed: int = 42):

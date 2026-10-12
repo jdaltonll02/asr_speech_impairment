@@ -6,11 +6,15 @@ normalisation before these are called).
 
 Public API
 ----------
-word_errors(ref, hyp)       → dict with substitutions/deletions/insertions counts
-corpus_wer(refs, hyps)      → float (aggregate WER across all utterances)
-per_utterance_wer(ref, hyp) → float (capped at ``cap``, default 1.0)
-uncapped_wer(ref, hyp)      → float
-cer(ref, hyp)               → float (character error rate)
+word_errors(ref, hyp)        → dict with substitutions/deletions/insertions counts
+compute_edit_ops(ref, hyp)   → alias for word_errors (plan Step 4 name)
+corpus_wer(refs, hyps)       → float (aggregate WER across all utterances)
+per_utterance_wer(ref, hyp)  → float (capped at ``cap``, default 1.0)
+uncapped_wer(ref, hyp)       → float
+cer(ref, hyp)                → float (character error rate)
+repeated_ngram_rate(text, n) → float (fraction of repeated n-grams)
+build_row(utt_id, ...)       → dict matching SCHEMA (plan Step 4 canonical row builder)
+SCHEMA                       → dict[str, str] dtype mapping for the canonical DataFrame
 """
 
 from __future__ import annotations
@@ -167,3 +171,125 @@ def repeated_ngram_rate(text: str, n: int = 4) -> float:
     counts = Counter(ngrams)
     repeated_positions = sum(count for count in counts.values() if count > 1)
     return repeated_positions / len(ngrams)
+
+
+# Alias required by plan Step 4 public API
+def compute_edit_ops(ref: str, hyp: str) -> dict:
+    """Alias for ``word_errors`` using the plan's specified function name.
+
+    Parameters
+    ----------
+    ref:
+        Normalised reference string.
+    hyp:
+        Normalised hypothesis string.
+
+    Returns
+    -------
+    dict
+        Keys: ``substitutions``, ``deletions``, ``insertions``,
+        ``total_ref_words``, ``total_hyp_words``.
+    """
+    return word_errors(ref, hyp)
+
+
+def build_row(
+    utt_id: str,
+    split: str,
+    model_name: str,
+    audio_path: str,
+    duration_s: float,
+    ref: str,
+    hyp: str,
+    compression_ratio: float | None = None,
+    avg_log_prob: float | None = None,
+    prompt_type: str = "",
+    recording_env: str = "",
+    speaker_id: str = "",
+    leading_silence_s: float = 0.0,
+    trailing_silence_s: float = 0.0,
+    snr_db: float = 0.0,
+) -> dict:
+    """Build a canonical per-utterance result row (matches ``SCHEMA``).
+
+    Computes all metric fields from *ref* and *hyp* and assembles a flat dict
+    whose keys match ``SCHEMA``.  Callers are expected to have already
+    normalised *ref* and *hyp* via ``normalise.py``.
+
+    Parameters
+    ----------
+    utt_id:
+        Unique utterance identifier.
+    split:
+        Dataset split name (``'dev'``, ``'test'``, etc.).
+    model_name:
+        Model alias (``'KY'`` or ``'EN'``).
+    audio_path:
+        Absolute path to the audio file.
+    duration_s:
+        Audio duration in seconds.
+    ref:
+        Normalised reference string.
+    hyp:
+        Normalised hypothesis string.
+    compression_ratio:
+        Whisper compression ratio (from ``audio.compute_compression_ratio``).
+    avg_log_prob:
+        Mean token log-probability (from ``model.generate`` sequences_scores).
+    prompt_type:
+        Prompt type metadata field.
+    recording_env:
+        Recording environment metadata field.
+    speaker_id:
+        Speaker identifier.
+    leading_silence_s:
+        Leading silence duration in seconds.
+    trailing_silence_s:
+        Trailing silence duration in seconds.
+    snr_db:
+        Estimated signal-to-noise ratio in dB.
+
+    Returns
+    -------
+    dict
+        Flat dict with all keys from ``SCHEMA``.
+    """
+    import math
+
+    errs = word_errors(ref, hyp)
+    wer_cap = per_utterance_wer(ref, hyp)
+    wer_uncap = uncapped_wer(ref, hyp)
+    cer_val = cer(ref, hyp)
+    rep_rate = repeated_ngram_rate(hyp, n=4)
+    length_rat = errs["total_hyp_words"] / max(errs["total_ref_words"], 1)
+
+    return {
+        "utt_id": utt_id,
+        "split": split,
+        "model": model_name,
+        "audio_path": audio_path,
+        "audio_length_sec": float(duration_s),
+        "reference": ref,
+        "hypothesis": hyp,
+        "reference_normalised": ref,
+        "hypothesis_normalised": hyp,
+        "n_ref_words": int(errs["total_ref_words"]),
+        "n_hyp_words": int(errs["total_hyp_words"]),
+        "substitutions": int(errs["substitutions"]),
+        "deletions": int(errs["deletions"]),
+        "insertions": int(errs["insertions"]),
+        "wer_capped": float(wer_cap),
+        "wer_uncapped": float(wer_uncap),
+        "cer": float(cer_val),
+        "length_ratio": float(length_rat),
+        "compression_ratio": float(compression_ratio) if compression_ratio is not None else float("nan"),
+        "avg_log_prob": float(avg_log_prob) if avg_log_prob is not None else float("nan"),
+        "repeated_4gram_rate": float(rep_rate),
+        "is_catastrophic": False,  # set downstream by failure.py
+        "prompt_type": str(prompt_type),
+        "recording_environment": str(recording_env),
+        "speaker_id": str(speaker_id),
+        "leading_silence_s": float(leading_silence_s),
+        "trailing_silence_s": float(trailing_silence_s),
+        "snr_db": float(snr_db),
+    }

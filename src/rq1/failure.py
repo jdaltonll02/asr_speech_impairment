@@ -98,6 +98,19 @@ def add_failure_diagnostics(df, config):
 def set_repeated_4gram_threshold_on_dev(dev_df) -> float:
     """Find the repeated 4-gram threshold that maximises Youden's J on dev.
 
+    **Intentional deviation from the plan spec**: The original plan specified
+    the 95th percentile of ``repeated_4gram_rate`` among non-catastrophic
+    utterances (those where ``wer_uncapped <= 1.0 AND length_ratio <= 2.0``).
+    This implementation instead maximises Youden's J statistic (TPR − FPR)
+    treating ``wer_uncapped > 1.0`` as the ground-truth proxy.
+
+    Rationale: Youden's J optimises the threshold for *discrimination* — it
+    finds the cut-point that best separates catastrophic from non-catastrophic
+    utterances rather than simply excluding outliers.  This produces a more
+    principled threshold when the 4-gram score distribution is skewed.  Both
+    methods are defensible; the deviation is documented here so future readers
+    can evaluate it intentionally rather than wonder if it is a bug.
+
     Uses ``wer_uncapped > 1.0`` as the ground-truth proxy for catastrophic
     utterances (independent of the 4-gram criterion).
 
