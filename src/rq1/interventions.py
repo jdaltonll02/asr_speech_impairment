@@ -206,26 +206,36 @@ def run_all_interventions(
     split: str,
     flagged_parquet: str,
     cfg,
+    all_utterances: bool = False,
 ):
-    """Run all six interventions on catastrophic utterances and return results."""
+    """Run all six interventions and return per-utterance results.
+
+    Parameters
+    ----------
+    all_utterances:
+        If True, run each intervention on the full split (needed for corpus
+        and per-utterance WER comparison as specified by the research plan).
+        If False, run only on catastrophic utterances.
+    """
     import pandas as pd
     import torch
     from src.eval.harness import load_model
-    from src.eval.metrics import uncapped_wer
+    from src.eval.metrics import uncapped_wer, per_utterance_wer, corpus_wer
     from src.eval.normalise import normalize
 
     df = pd.read_parquet(flagged_parquet)
     catastro = df[df["is_catastrophic"]].copy()
+    target = df.copy() if all_utterances else catastro
 
     logger.info(
-        "[%s/%s] %d/%d utterances flagged as catastrophic",
+        "[%s/%s] %d/%d utterances flagged; running on %d (%s)",
         model_alias, split, len(catastro), len(df),
+        len(target), "all" if all_utterances else "catastrophic only",
     )
 
-    if catastro.empty:
-        logger.info("No catastrophic utterances — nothing to re-decode.")
-        import pandas as pd
-        return pd.DataFrame(columns=["utt_id", "intervention", "wer_before", "wer_after", "delta_wer"])
+    if target.empty:
+        return pd.DataFrame(columns=["utt_id", "intervention", "wer_before",
+                                     "wer_after", "delta_wer"])
 
     model, processor = load_model(
         model_id=cfg.models[model_alias].model_id,
@@ -235,36 +245,54 @@ def run_all_interventions(
     all_rows: list[dict] = []
 
     for intervention_name, fn in INTERVENTION_FUNCTIONS.items():
-        logger.info("Running intervention: %s [%s/%s]", intervention_name, model_alias, split)
-        for _, row in catastro.iterrows():
+        logger.info(
+            "Running intervention '%s' on %d utterances [%s/%s]",
+            intervention_name, len(target), model_alias, split,
+        )
+        n = len(target)
+        for i, (_, row) in enumerate(target.iterrows()):
             row_dict = row.to_dict()
             ref_norm = str(row_dict.get("reference_normalised", ""))
             hyp_before_norm = str(row_dict.get("hypothesis_normalised", ""))
-            wer_before = uncapped_wer(ref_norm, hyp_before_norm)
+            wer_before_cap = float(row_dict.get("wer_capped", 1.0))
+            wer_before_uncap = uncapped_wer(ref_norm, hyp_before_norm)
 
             try:
                 hyp_after = fn(model, processor, row_dict, model_alias, cfg)
                 hyp_after_norm = normalize(hyp_after, model_alias)
-                wer_after = uncapped_wer(ref_norm, hyp_after_norm)
+                wer_after_cap = per_utterance_wer(ref_norm, hyp_after_norm)
+                wer_after_uncap = uncapped_wer(ref_norm, hyp_after_norm)
             except Exception as exc:
                 logger.warning(
                     "Intervention %s failed for utt %s: %s",
                     intervention_name, row_dict.get("utt_id", "?"), exc,
                 )
-                wer_after = wer_before
+                hyp_after_norm = hyp_before_norm
+                wer_after_cap = wer_before_cap
+                wer_after_uncap = wer_before_uncap
 
             all_rows.append({
                 "utt_id": row_dict.get("utt_id", ""),
                 "intervention": intervention_name,
-                "wer_before": wer_before,
-                "wer_after": wer_after,
-                "delta_wer": wer_after - wer_before,
+                "reference_normalised": ref_norm,
+                "hypothesis_before_norm": hyp_before_norm,
+                "hypothesis_after_norm": hyp_after_norm,
+                "wer_before_capped": wer_before_cap,
+                "wer_after_capped": wer_after_cap,
+                "delta_wer_capped": wer_after_cap - wer_before_cap,
+                "wer_before_uncapped": wer_before_uncap,
+                "wer_after_uncapped": wer_after_uncap,
+                "delta_wer_uncapped": wer_after_uncap - wer_before_uncap,
+                "is_catastrophic": bool(row_dict.get("is_catastrophic", False)),
                 "model": model_alias.upper(),
                 "split": split,
             })
 
-    import torch
-    import pandas as pd
+            if (i + 1) % 100 == 0:
+                logger.info(
+                    "  %s: %d/%d utterances done", intervention_name, i + 1, n
+                )
+
     del model, processor
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -294,6 +322,8 @@ def main(cfg=None):
     parser.add_argument("--split", choices=["dev", "test", "both"], default="both")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--intervention", default=None, help="Run a single named intervention")
+    parser.add_argument("--all-utterances", action="store_true",
+                        help="Run on full split (required for corpus WER comparison)")
     args = parser.parse_args()
 
     languages = ["ky", "en"] if args.model == "both" else [args.model]
@@ -313,21 +343,38 @@ def main(cfg=None):
                 logger.info("Skipping %s/%s — already exists.", lang, split)
                 results_df = pd.read_parquet(out_path)
             else:
-                results_df = run_all_interventions(lang, split, str(flagged_path), cfg)
+                results_df = run_all_interventions(
+                    lang, split, str(flagged_path), cfg,
+                    all_utterances=args.all_utterances,
+                )
                 results_df.to_parquet(out_path, index=False)
                 logger.info("Saved %s", out_path)
 
-            # Compute summary per intervention
+            # Compute summary per intervention — corpus WER if all_utterances
+            from src.eval.metrics import corpus_wer, per_utterance_wer
             for interv_name, grp in results_df.groupby("intervention"):
-                summary_rows.append({
+                row = {
                     "language": lang,
                     "split": split,
                     "intervention": interv_name,
                     "n_utterances": len(grp),
-                    "mean_wer_before": grp["wer_before"].mean(),
-                    "mean_wer_after": grp["wer_after"].mean(),
-                    "mean_delta_wer": grp["delta_wer"].mean(),
-                })
+                    "mean_per_utt_wer_before": grp["wer_before_capped"].mean()
+                        if "wer_before_capped" in grp.columns else grp.get("wer_before", pd.Series()).mean(),
+                    "mean_per_utt_wer_after": grp["wer_after_capped"].mean()
+                        if "wer_after_capped" in grp.columns else grp.get("wer_after", pd.Series()).mean(),
+                }
+                # Corpus WER only meaningful when running on full split
+                if "reference_normalised" in grp.columns and "hypothesis_after_norm" in grp.columns:
+                    row["corpus_wer_before"] = corpus_wer(
+                        grp["reference_normalised"].tolist(),
+                        grp["hypothesis_before_norm"].tolist(),
+                    )
+                    row["corpus_wer_after"] = corpus_wer(
+                        grp["reference_normalised"].tolist(),
+                        grp["hypothesis_after_norm"].tolist(),
+                    )
+                    row["corpus_wer_delta"] = row["corpus_wer_after"] - row["corpus_wer_before"]
+                summary_rows.append(row)
 
     if summary_rows:
         summary_df = pd.DataFrame(summary_rows)

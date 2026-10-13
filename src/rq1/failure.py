@@ -183,6 +183,37 @@ def flag_catastrophic(df, threshold_4gram: float, config):
     return df
 
 
+def compute_failure_features(df):
+    """Public alias for ``add_failure_diagnostics`` without requiring a config.
+
+    Computes derived diagnostic columns (length_ratio, compression_ratio,
+    repeated_4gram_rate) using default thresholds.  Use ``add_failure_diagnostics``
+    when a config object is available; use this in tests and notebooks.
+    """
+    from src.utils.config import load_config
+    cfg = load_config()
+    return add_failure_diagnostics(df, cfg)
+
+
+def apply_catastrophic_flag(
+    df,
+    wer_threshold: float = 1.0,
+    length_ratio_threshold: float = 2.0,
+    ngram_threshold: float = 0.1,
+):
+    """Public alias for ``flag_catastrophic`` with explicit threshold args.
+
+    Useful in tests and notebooks where a full config object is not needed.
+    """
+    df = df.copy()
+    df["is_catastrophic"] = (
+        (df["wer_uncapped"] > wer_threshold)
+        | (df["length_ratio"] > length_ratio_threshold)
+        | (df["repeated_4gram_rate"] > ngram_threshold)
+    )
+    return df
+
+
 def compute_summary(df) -> dict:
     """Compute the share of catastrophic utterances and word errors.
 
@@ -297,10 +328,8 @@ def main(cfg=None):
     thresh_path.write_text(json.dumps(thresholds, indent=2))
     logger.info("Thresholds saved to %s", thresh_path)
 
-    # Apply final flags and save failure parquets
-    print("\n=== Table 1: Catastrophic Failure Summary ===")
-    print(f"{'Language':<10} {'Split':<8} {'N':<8} {'Catastro.':<12} {'%Utts':<10} {'%WordErr':<10}")
-    print("-" * 60)
+    # Apply final flags, save failure parquets, and collect summary rows
+    summary_rows = []
 
     for (lang, split), df in dfs.items():
         df = flag_catastrophic(df, threshold_4gram, cfg)
@@ -311,13 +340,105 @@ def main(cfg=None):
         logger.info("Saved %s", out_path)
 
         summary = compute_summary(df)
-        print(
-            f"{lang:<10} {split:<8} {summary['n_total']:<8} "
-            f"{summary['n_catastrophic']:<12} "
-            f"{summary['share_utterances']:.1%}    "
-            f"{summary['share_word_errors']:.1%}"
-        )
+        summary["language"] = lang
+        summary["split"] = split
+        summary_rows.append(summary)
 
+    # -----------------------------------------------------------------------
+    # Save Table 1 as CSV
+    # -----------------------------------------------------------------------
+    summary_df = pd.DataFrame(summary_rows)[
+        ["language", "split", "n_total", "n_catastrophic",
+         "share_utterances", "total_word_errors",
+         "catastrophic_word_errors", "share_word_errors"]
+    ]
+    table1_path = failure_dir / "failure_summary.csv"
+    summary_df.to_csv(table1_path, index=False)
+    logger.info("Table 1 saved to %s", table1_path)
+
+    # -----------------------------------------------------------------------
+    # Save per-utterance breakdown for catastrophic utterances
+    # -----------------------------------------------------------------------
+    catastro_rows = []
+    for (lang, split), df in dfs.items():
+        subset = df[df["is_catastrophic"]][[
+            "utt_id", "speaker_id", "severity", "prompt_type",
+            "audio_length_sec", "wer_capped", "wer_uncapped",
+            "length_ratio", "compression_ratio", "avg_log_prob",
+            "repeated_4gram_rate", "reference", "hypothesis",
+        ]].copy() if "severity" in df.columns else df[df["is_catastrophic"]][[
+            "utt_id", "speaker_id", "prompt_type",
+            "audio_length_sec", "wer_capped", "wer_uncapped",
+            "length_ratio", "compression_ratio", "avg_log_prob",
+            "repeated_4gram_rate", "reference", "hypothesis",
+        ]].copy()
+        subset.insert(0, "language", lang)
+        subset.insert(1, "split", split)
+        catastro_rows.append(subset)
+
+    if catastro_rows:
+        catastro_df = pd.concat(catastro_rows, ignore_index=True)
+        catastro_path = failure_dir / "catastrophic_utterances.csv"
+        catastro_df.to_csv(catastro_path, index=False)
+        logger.info("Catastrophic utterances saved to %s", catastro_path)
+
+    # -----------------------------------------------------------------------
+    # Plot: per-utterance WER distribution (KY vs EN), catastrophics highlighted
+    # -----------------------------------------------------------------------
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import numpy as np
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=False)
+        plot_configs = [
+            ("ky", "test", axes[0], "Kinyarwanda (test)"),
+            ("en", "test", axes[1], "Rwandan English (test)"),
+        ]
+        for lang, split, ax, title in plot_configs:
+            key = (lang, split)
+            if key not in dfs:
+                continue
+            df = dfs[key]
+            normal = df[~df["is_catastrophic"]]["wer_capped"]
+            catast = df[df["is_catastrophic"]]["wer_capped"]
+            bins = np.linspace(0, 1.0, 41)
+            ax.hist(normal, bins=bins, color="#4C9BE8", alpha=0.8,
+                    label=f"Normal (n={len(normal)})")
+            ax.hist(catast, bins=bins, color="#E84C4C", alpha=0.9,
+                    label=f"Catastrophic (n={len(catast)})")
+            ax.set_title(title, fontsize=13)
+            ax.set_xlabel("Per-utterance WER (capped at 1.0)", fontsize=11)
+            ax.set_ylabel("Number of utterances", fontsize=11)
+            ax.legend(fontsize=10)
+            ax.grid(axis="y", alpha=0.3)
+
+        fig.suptitle(
+            "Per-utterance WER distribution — catastrophic failures highlighted",
+            fontsize=13, y=1.01,
+        )
+        plt.tight_layout()
+        plot_path = failure_dir / "wer_distribution.png"
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info("WER distribution plot saved to %s", plot_path)
+    except Exception as exc:
+        logger.warning("Could not generate WER distribution plot: %s", exc)
+
+    # -----------------------------------------------------------------------
+    # Print Table 1 to stdout
+    # -----------------------------------------------------------------------
+    print("\n=== Table 1: Catastrophic Failure Summary ===")
+    print(f"{'Language':<10} {'Split':<8} {'N':<8} {'Catastro.':<12} {'%Utts':<10} {'%WordErr':<10}")
+    print("-" * 60)
+    for row in summary_rows:
+        print(
+            f"{row['language']:<10} {row['split']:<8} {row['n_total']:<8} "
+            f"{row['n_catastrophic']:<12} "
+            f"{row['share_utterances']:.1%}    "
+            f"{row['share_word_errors']:.1%}"
+        )
+    print(f"\nFiles saved to: {failure_dir}")
     print()
 
 

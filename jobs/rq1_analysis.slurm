@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=rq1_analysis
 #SBATCH --partition=preempt
+#SBATCH --qos=preempt_qos
 #SBATCH --mem=16G
 #SBATCH --time=02:00:00
 #SBATCH --output=/data/user_data/jgibson2/asr_sprint/results/rq1/logs/analysis_%j.log

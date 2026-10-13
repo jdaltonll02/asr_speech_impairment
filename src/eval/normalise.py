@@ -35,8 +35,9 @@ try:
         return _normalizer(text)
 
 except Exception:
-    # Pure-Python fallback: lowercase + remove punctuation + collapse whitespace
-    _PUNCT_TABLE = str.maketrans("", "", string.punctuation)
+    # Pure-Python fallback: lowercase + remove punctuation (keep apostrophe for
+    # KY elision handling downstream) + collapse whitespace
+    _PUNCT_TABLE = str.maketrans("", "", string.punctuation.replace("'", ""))
 
     def _basic_normalize(text: str) -> str:  # type: ignore[misc]
         text = text.lower()
@@ -64,16 +65,17 @@ def normalize(text: str | None, language: str) -> str:
     if not text:
         return ""
 
-    # Apply Whisper BasicTextNormalizer (shared for all languages)
-    text = _basic_normalize(text)
-
     if language in ("ky", "rw"):
+        # Apply KY elision BEFORE basic normalisation: the BasicTextNormalizer
+        # strips apostrophes, so we must join elided tokens first.
         # Unify apostrophe glyphs to ASCII apostrophe
         text = text.replace("\u2019", "'").replace("\u02bc", "'")
         # Remove elision apostrophe between word characters: n'abantu → nabantu
         text = re.sub(r"(\w)'(\w)", r"\1\2", text)
 
-    # Final whitespace collapse (BasicTextNormalizer should already do this,
-    # but apply again after Kinyarwanda transforms)
+    # Apply Whisper BasicTextNormalizer (shared for all languages)
+    text = _basic_normalize(text)
+
+    # Final whitespace collapse
     text = " ".join(text.split())
     return text

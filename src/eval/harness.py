@@ -172,7 +172,8 @@ def transcribe_dataset(
     batch_size: int,
     results_root: str,
     checkpoint_path: str | None = None,
-    checkpoint_every: int = 100,
+    checkpoint_every: int = 50,
+    prior_rows: list[dict] | None = None,
 ):
     """Transcribe all utterances in *dataset_df* and return a results DataFrame.
 
@@ -203,6 +204,9 @@ def transcribe_dataset(
         *results_root*.
     checkpoint_every:
         Flush checkpoint to disk after every this many utterances.
+    prior_rows:
+        Rows already completed in a previous run (from a checkpoint).  These
+        are prepended to the output so the returned DataFrame is complete.
 
     Returns
     -------
@@ -215,7 +219,7 @@ def transcribe_dataset(
     from src.eval import normalise as norm_mod
     from src.utils import audio as audio_mod
 
-    rows: list[dict] = []
+    rows: list[dict] = list(prior_rows) if prior_rows else []
     last_saved_index = -1
 
     # Determine reference text column

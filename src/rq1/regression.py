@@ -70,9 +70,11 @@ def build_feature_matrix(df) -> "tuple":
         "snr_db",
     ]
     categorical_cols = ["prompt_type", "recording_environment"]
-    # severity may be present after speaker_metadata join
+    # severity and speaker_id added if present after speaker_metadata join
     if "severity" in df.columns:
         categorical_cols.append("severity")
+    if "speaker_id" in df.columns:
+        categorical_cols.append("speaker_id")
 
     # Fill missing values
     df_feat = df.copy()
@@ -335,6 +337,51 @@ def stratified_sample(df, n: int = 50, random_seed: int = 42):
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _join_speaker_metadata(df, cfg, languages: list[str]):
+    """Join severity and speech_type from speaker_metadata CSVs into *df*.
+
+    Tries language-prefixed files ({lang}_speaker_metadata.csv) for each
+    language present in the data, falls back to speaker_metadata.csv.
+    Safe to call if severity is already present — returns df unchanged.
+    """
+    import pandas as pd
+    from pathlib import Path
+
+    if "severity" in df.columns:
+        return df
+
+    data_root = Path(cfg.data_root)
+    meta_frames = []
+
+    for lang in languages:
+        for fname in [f"{lang}_speaker_metadata.csv", "speaker_metadata.csv"]:
+            p = data_root / fname
+            if p.exists():
+                m = pd.read_csv(p, dtype=str)
+                m.columns = [c.strip().lower().replace(" ", "_") for c in m.columns]
+                m["speaker_id"] = m["speaker_id"].str.strip()
+                if "severity_speech_impairment" in m.columns:
+                    m = m.rename(columns={"severity_speech_impairment": "severity"})
+                if "type_nonstandard_speech" in m.columns:
+                    m = m.rename(columns={"type_nonstandard_speech": "speech_type"})
+                meta_frames.append(m[["speaker_id", "severity"] +
+                                    (["speech_type"] if "speech_type" in m.columns else [])])
+                break
+
+    if not meta_frames:
+        logger.warning("No speaker_metadata.csv found — severity will be absent from features.")
+        return df
+
+    meta = pd.concat(meta_frames).drop_duplicates("speaker_id")
+    df = df.merge(meta, on="speaker_id", how="left")
+    logger.info("Joined severity for %d/%d rows", df["severity"].notna().sum(), len(df))
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -381,9 +428,28 @@ def main(cfg=None):
     dev_df = pd.concat(dev_dfs, ignore_index=True)
     test_df = pd.concat(test_dfs, ignore_index=True) if test_dfs else dev_df.copy()
 
-    # Build feature matrices
+    # Join speaker metadata (severity) if not already present
+    for df_ref, name in [(dev_df, "dev"), (test_df, "test")]:
+        if "severity" not in df_ref.columns and "speaker_id" in df_ref.columns:
+            logger.info("Joining speaker metadata into %s split", name)
+
+    dev_df = _join_speaker_metadata(dev_df, cfg, languages)
+    test_df = _join_speaker_metadata(test_df, cfg, languages)
+
+    # Build feature matrices — fit on train, align test columns to match
     X_train, y_train, feature_names = build_feature_matrix(dev_df)
-    X_test, y_test, _ = build_feature_matrix(test_df)
+
+    # Align test to same dummy columns by rebuilding from combined then splitting
+    combined = pd.concat([dev_df.assign(_fold="train"), test_df.assign(_fold="test")],
+                          ignore_index=True)
+    import numpy as np
+    import pandas as pd
+    X_all, y_all, feature_names = build_feature_matrix(combined)
+    fold = combined["_fold"].values
+    X_train = X_all[fold == "train"]
+    y_train = y_all[fold == "train"]
+    X_test  = X_all[fold == "test"]
+    y_test  = y_all[fold == "test"]
 
     # Standardise numeric features (fit on train, apply to test)
     scaler = StandardScaler()

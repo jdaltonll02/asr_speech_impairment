@@ -144,7 +144,7 @@ def plot_wer_distribution(rq1_dir: Path) -> None:
 
 
 def plot_intervention_comparison(rq1_dir: Path) -> None:
-    """Grouped bar chart: mean ∆WER for baseline + 6 interventions per language."""
+    """Grouped bar chart: corpus WER before/after for each intervention."""
     import pandas as pd
     import matplotlib
     matplotlib.use("Agg")
@@ -157,9 +157,20 @@ def plot_intervention_comparison(rq1_dir: Path) -> None:
         return
 
     df = pd.read_csv(summary_path)
-    test_df = df[df["split"] == "test"]
+    test_df = df[df["split"] == "test"].copy()
     if test_df.empty:
-        test_df = df  # fall back to all splits
+        test_df = df.copy()
+
+    # Prefer corpus_wer_delta if available, fall back to per-utt delta
+    if "corpus_wer_delta" in test_df.columns:
+        delta_col = "corpus_wer_delta"
+        ylabel = "Corpus WER delta (negative = improvement)"
+    elif "mean_delta_wer" in test_df.columns:
+        delta_col = "mean_delta_wer"
+        ylabel = "Mean per-utt ∆WER (negative = improvement)"
+    else:
+        logger.warning("No delta WER column found in intervention_summary.csv — skipping plot.")
+        return
 
     interventions = sorted(test_df["intervention"].unique())
     languages = sorted(test_df["language"].unique())
@@ -168,22 +179,24 @@ def plot_intervention_comparison(rq1_dir: Path) -> None:
     width = 0.35
     fig, ax = plt.subplots(figsize=(12, 6))
 
-    for i, lang in enumerate(languages):
+    colors = ["#4C9BE8", "#E8844C"]
+    for i, (lang, color) in enumerate(zip(languages, colors)):
         lang_df = test_df[test_df["language"] == lang]
         means = [
-            lang_df[lang_df["intervention"] == iv]["mean_delta_wer"].mean()
+            lang_df[lang_df["intervention"] == iv][delta_col].mean()
             if iv in lang_df["intervention"].values else 0.0
             for iv in interventions
         ]
         offset = (i - len(languages) / 2 + 0.5) * width
-        bars = ax.bar(x + offset, means, width, label=lang.upper())
+        ax.bar(x + offset, means, width, label=lang.upper(), color=color, alpha=0.85)
 
-    ax.axhline(y=0, color="black", linewidth=0.8, linestyle="-")
+    ax.axhline(y=0, color="black", linewidth=0.8)
     ax.set_xlabel("Intervention")
-    ax.set_ylabel("Mean ∆WER (negative = improvement)")
-    ax.set_title("Intervention Effect on Catastrophic Utterances")
+    ax.set_ylabel(ylabel)
+    ax.set_title("RQ1: Effect of Decoding Interventions on WER (test split)")
     ax.set_xticks(x)
-    ax.set_xticklabels(interventions, rotation=20, ha="right")
+    ax.set_xticklabels([iv.replace("_", "\n") for iv in interventions],
+                       fontsize=9, ha="center")
     ax.legend()
     plt.tight_layout()
 

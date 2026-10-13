@@ -92,10 +92,12 @@ def run_baseline(
 
         for split in splits:
             out_path = _results_path(cfg.results_root, lang, split)
+            checkpoint_path = str(out_path).replace(".parquet", "_checkpoint.parquet")
 
             if resume and out_path.exists():
-                logger.info("Skipping %s/%s — parquet already exists.", lang, split)
+                logger.info("Skipping %s/%s — final parquet already exists.", lang, split)
                 df = pd.read_parquet(out_path)
+
             else:
                 # Lazy-load the model (once per language)
                 if model is None:
@@ -108,14 +110,38 @@ def run_baseline(
                 logger.info("Loading split: language=%s, split=%s", lang, split)
                 split_df = load_split(split, lang, cfg.data_root)
 
+                # Resume from partial checkpoint if it exists
+                already_done_ids: set[str] = set()
+                existing_rows: list[dict] = []
+                ckpt = Path(checkpoint_path)
+                if ckpt.exists():
+                    try:
+                        ckpt_df = pd.read_parquet(ckpt)
+                        existing_rows = ckpt_df.to_dict("records")
+                        already_done_ids = set(ckpt_df["utt_id"].tolist())
+                        logger.info(
+                            "Resuming %s/%s from checkpoint: %d/%d utterances already done.",
+                            lang, split, len(already_done_ids), len(split_df),
+                        )
+                        # Filter out already-done rows from the split
+                        split_df = split_df[
+                            ~split_df["utt_id"].isin(already_done_ids)
+                        ].reset_index(drop=True)
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not read checkpoint %s: %s — restarting from scratch.",
+                            ckpt, exc,
+                        )
+                        existing_rows = []
+
                 decode_kwargs = _decode_kwargs(lang, cfg)
-                checkpoint_path = str(out_path).replace(".parquet", "_checkpoint.parquet")
 
                 logger.info(
                     "Transcribing %d utterances (lang=%s, split=%s)...",
                     len(split_df), lang, split,
                 )
-                df = transcribe_dataset(
+
+                new_df = transcribe_dataset(
                     model=model,
                     processor=processor,
                     dataset_df=split_df,
@@ -124,10 +150,18 @@ def run_baseline(
                     batch_size=cfg.decode.batch_size,
                     results_root=str(Path(cfg.results_root) / "rq1"),
                     checkpoint_path=checkpoint_path,
-                    checkpoint_every=100,
+                    checkpoint_every=cfg.decode.get("checkpoint_every", 50),
+                    prior_rows=existing_rows,
                 )
+
+                df = new_df
                 df.to_parquet(out_path, index=False)
-                logger.info("Saved %s", out_path)
+                logger.info("Saved final results: %s", out_path)
+
+                # Clean up checkpoint now that we have the final file
+                if ckpt.exists():
+                    ckpt.unlink()
+                    logger.info("Removed checkpoint %s", ckpt)
 
             # Compute corpus WER / CER
             w = corpus_wer(

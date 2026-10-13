@@ -132,11 +132,21 @@ def load_split(split_name: str, language: str, data_root: str):
     # Normalise column names to lowercase and replace spaces with underscores
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Join speaker metadata if available
-    meta_file = root / SPEAKER_METADATA_FILE
+    # Join speaker metadata if available — try language-prefixed file first,
+    # then fall back to generic speaker_metadata.csv
+    meta_file = root / f"{language}_{SPEAKER_METADATA_FILE}"
+    if not meta_file.exists():
+        meta_file = root / SPEAKER_METADATA_FILE
     if meta_file.exists():
         meta = pd.read_csv(meta_file, dtype=str)
         meta.columns = [c.strip().lower().replace(" ", "_") for c in meta.columns]
+        # Strip whitespace from speaker_id values (e.g. "RW004 " in source data)
+        meta["speaker_id"] = meta["speaker_id"].str.strip()
+        # Rename severity column to a consistent short name
+        if "severity_speech_impairment" in meta.columns:
+            meta = meta.rename(columns={"severity_speech_impairment": "severity"})
+        if "type_nonstandard_speech" in meta.columns:
+            meta = meta.rename(columns={"type_nonstandard_speech": "speech_type"})
         if "speaker_id" in df.columns and "speaker_id" in meta.columns:
             df = df.merge(meta, on="speaker_id", how="left")
 
@@ -234,16 +244,20 @@ def download_dataset(
         from src.utils.config import load_config
         cfg = load_config()
 
-    # Resolve token
+    # Resolve token — try explicit arg, then env var, then huggingface_hub's
+    # built-in resolver (covers all CLI versions and storage locations).
     token = hf_token or os.environ.get("HF_TOKEN")
     if not token:
-        token_file = Path.home() / ".cache" / "huggingface" / "token"
-        if token_file.exists():
-            token = token_file.read_text().strip()
+        try:
+            from huggingface_hub import get_token
+            token = get_token()
+        except Exception:
+            token = None
     if not token:
         raise RuntimeError(
-            "HF_TOKEN not found. Set the HF_TOKEN environment variable or place "
-            "your token in ~/.cache/huggingface/token before running --download."
+            "No HuggingFace token found. Run `hf auth login` (hf CLI v2) or "
+            "`huggingface-cli login` to authenticate, or set the HF_TOKEN "
+            "environment variable."
         )
 
     try:
@@ -264,32 +278,69 @@ def download_dataset(
 
     hf_split_names = list(split_map.__dict__.items()) if hasattr(split_map, "__dict__") else split_map.items()
 
+    import pandas as pd
+
     for local_name, hf_split in hf_split_names:
         print(f"Downloading {hf_id} / {hf_split} → {local_name} ...")
+        # Load without decoding audio to avoid torchcodec dependency at this stage.
         ds = load_dataset(hf_id, split=hf_split, token=token)
 
+        # Disable audio decoding — keeps the struct<bytes, path> intact but
+        # never calls torchcodec/soundfile. This is the correct API for datasets v5.
+        from datasets import Audio as AudioFeature
+        ds = ds.cast_column("audio", AudioFeature(decode=False))
+
+        # Save audio files to disk and build TSV with local paths.
+        audio_dir = out_dir / "audio" / language / local_name
+        audio_dir.mkdir(parents=True, exist_ok=True)
+
         out_path = out_dir / f"{language}_{local_name}.tsv"
-        import pandas as pd
         rows = []
-        for i, row in enumerate(ds):
-            audio_info = row.get(audio_col, {})
+
+        ds_raw = ds
+
+        for i, row in enumerate(ds_raw):
+            utt_id = row.get("audio_id") or row.get("id") or row.get("utt_id") or f"{language}_{local_name}_{i:06d}"
+            audio_info = row.get("audio", {})
+
+            # audio_info is a dict: {"bytes": <bytes|None>, "path": <str|None>}
+            audio_path_str = ""
             if isinstance(audio_info, dict):
-                audio_path = audio_info.get("path", "")
+                raw_bytes = audio_info.get("bytes")
+                src_path = audio_info.get("path") or ""
+
+                if raw_bytes:
+                    suffix = Path(src_path).suffix if src_path else ".flac"
+                    if not suffix:
+                        suffix = ".flac"
+                    local_audio = audio_dir / f"{utt_id}{suffix}"
+                    if not local_audio.exists():
+                        local_audio.write_bytes(raw_bytes)
+                    audio_path_str = str(local_audio)
+                elif src_path:
+                    audio_path_str = src_path
             else:
-                audio_path = str(audio_info)
+                audio_path_str = str(audio_info)
+
             rows.append({
-                "utt_id": row.get("id", f"{language}_{local_name}_{i:06d}"),
-                "audio_path": audio_path,
-                "transcription": row.get(text_col, ""),
+                "utt_id": utt_id,
+                "audio_path": audio_path_str,
+                "transcription": row.get("transcription", ""),
                 "speaker_id": row.get("speaker_id", ""),
                 "prompt_type": row.get("prompt_type", ""),
+                "prompt_id": row.get("prompt_id", ""),
                 "recording_environment": row.get("recording_environment", ""),
                 "recording_device": row.get("recording_device", ""),
                 "audio_length": row.get("audio_length", ""),
                 "transcript_length": row.get("transcript_length", ""),
-                "transcriber_confidence": row.get("transcriber_confidence", ""),
+                "transcriber_confidence": row.get("confidence", ""),
+                "recording_date": row.get("recording_date", ""),
             })
+
+            if (i + 1) % 500 == 0:
+                print(f"  {i + 1} rows processed...")
+
         pd.DataFrame(rows).to_csv(out_path, sep="\t", index=False)
-        print(f"  Saved {len(rows)} rows to {out_path}")
+        print(f"  Saved {len(rows)} rows → {out_path}")
 
     print(f"\nDownload complete for language='{language}'. Data in {out_dir}")
