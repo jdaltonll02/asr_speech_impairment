@@ -212,6 +212,7 @@ def _silero_trim(
             force_reload=False,
             onnx=False,
             verbose=False,
+            trust_repo=True,
         )
         (get_speech_timestamps, _, read_audio, *_) = utils
 

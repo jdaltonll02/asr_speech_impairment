@@ -386,10 +386,6 @@ def main(cfg=None):
         print(summary_df.to_string(index=False))
 
 
-if __name__ == "__main__":
-    main()
-
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -410,3 +406,7 @@ def _load_waveform(row: dict, audio_mod=None):
 def _lang_token(language: str, config) -> str:
     """Look up the language token for *language* from config."""
     return config.models[language].language_token
+
+
+if __name__ == "__main__":
+    main()

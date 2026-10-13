@@ -16,6 +16,13 @@ export TRANSFORMERS_CACHE=/data/user_data/jgibson2/asr_sprint/model_cache
 
 echo "Job started: $(date)  node: $(hostname)  jobid: $SLURM_JOB_ID"
 
+# Pre-trust silero-vad repo so VAD trim doesn't prompt interactively
+python -c "
+import torch
+torch.hub.load('snakers4/silero-vad', 'silero_vad', trust_repo=True, verbose=False)
+print('silero-vad pre-loaded')
+" 2>/dev/null || echo "silero-vad pre-load skipped (will use fallback)"
+
 # Run interventions on KY only (EN has ~6 catastrophic utterances — not informative).
 # --all-utterances: run each strategy on the full split, not just catastrophic ones,
 # so we can report corpus and per-utterance WER change as the plan requires.
